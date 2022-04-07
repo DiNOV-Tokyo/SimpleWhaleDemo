@@ -22,25 +22,66 @@ jobs:
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      -
-        name: Checkout 
-        uses: actions/checkout@v3
-      -
-        name: Login to Docker Hub
-        uses: docker/login-action@v1
+      # リポジトリの読み込み（fetch-depth=1）
+      - name: Check out repo under workspace
+        uses: actions/checkout@v2
+
+      # キャッシュ ID の作成（イメージのハッシュと日付から作成）
+      - name: Create image tag
+        id: imagetag
+        run: |
+          : # Dockerfile からハッシュ値を作成
+          HASH_IMAGE=${{ hashFiles('./Dockerfile') }}
+          : # 日付と 7 文字のハッシュ値で合計 13 文字の ID を作成
+          VARIANT=$(TZ=UTC-9 date '+%Y%m')${HASH_IMAGE:0:7}
+          : # イメージのタグを作成
+          NAME_IMAGE=myTestImage
+          TAG="${NAME_IMAGE}:${VARIANT}"
+          : # キャッシュする tar アーカイブ名とパスの設定
+          NAME_TAR="${NAME_IMAGE}.${VARIANT}.tar"
+          PATH_TAR=${{ env.PATH_CACHE }}"/${NAME_TAR}"
+          : # 変数を他の run でも使えるように output
+          echo "::set-output name=TAG::${TAG}"
+          echo "::set-output name=PATH_TAR::${PATH_TAR}"
+
+      # この Workflow が正常に終了したら path をキャッシュ。
+      # key が存在する場合、ついでに path にリストアする。
+      - name: Enable cache
+        id: cache
+        uses: actions/cache@v2
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      -
-        name: Build and push
-        uses: docker/build-push-action@v2
+          path: ${{ env.PATH_CACHE }}
+          key: ${{ steps.imagetag.outputs.TAG }}
+
+      # キャッシュがある場合は tar をロードしてイメージ一覧に追加
+      - name: Load Docker image if exists
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: docker load --input ${{ steps.imagetag.outputs.PATH_TAR }}
+
+      # キャッシュがない場合は Docker イメージをビルド後、tar アーカイブをキャッシュ先に保存
+      - name: Build Docker image and save
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          : # キャッシュディレクトリを作成
+          mkdir -p ${{ env.PATH_CACHE }}
+          : # 安定したビルドのためにベース・イメージを pull しておく（オプション）
+          docker pull mybaseimage:latest
+          : # イメージのビルド
+          docker build -f './.devcontainer/Dockerfile' -t ${{ steps.imagetag.outputs.TAG }} .
+          : # イメージのキャッシュ（tar をキャッシュ・ディレクトリに出力）
+          docker save --output ${{ steps.imagetag.outputs.PATH_TAR }} ${{ steps.imagetag.outputs.TAG }}
+
+      # 本処理
+      # イメージからコンテナを起動してテスト（entrypoint.sh）を実行
+      - name: Run tests for both Go and Shell Script
+        run: |
+          : # コンテナ内のスクリプトのパスを作成（マウントポイントから見たパス）
+          path_entrypoint=${{ env.PATH_MOUNT }}/path/to/hogefuga.sh
+          : # 実行
+          docker run -u root -v "$(pwd)":${{ env.PATH_MOUNT }} -w ${{ env.PATH_MOUNT }} ${{ steps.imagetag.outputs.TAG }} "$path_entrypoint"
+
+      # その他の処理（例えばカバレッジのアップデート）
+      - name: Upload coverage
+        uses: codecov/codecov-action@v1
         with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/simplewhale:latest
-          cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/simplewhale:buildcache
-          cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/simplewhale:buildcache,mode=max
+          token: ${{ secrets.CODECOV_TOKEN }}
